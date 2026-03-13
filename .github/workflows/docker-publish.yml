@@ -8,15 +8,15 @@ on:
 
 env:
   DOCKER_REPO: ${{ secrets.DOCKER_HUB_LOGIN }}
-  DOCKER_IMAGE_NAME: pushgateway
+  DOCKER_IMAGE_NAME: pushgateway-ttl
 
 jobs:
   test:
     name: Go tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -30,9 +30,9 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -56,25 +56,24 @@ jobs:
         run: $(go env GOPATH)/bin/promu crossbuild -p linux/${{ matrix.arch }}
 
       - name: Build Docker image
-        run: |
-          make docker-${{ matrix.arch }} \
-            DOCKER_REPO=${{ env.DOCKER_REPO }} \
-            DOCKER_IMAGE_TAG=${{ steps.tag.outputs.value }}
+        env:
+          DOCKER_IMAGE_TAG: ${{ steps.tag.outputs.value }}
+        run: make docker-${{ matrix.arch }}
 
       - name: Push to Docker Hub
+        env:
+          DOCKER_IMAGE_TAG: ${{ steps.tag.outputs.value }}
         run: |
           docker login -u ${{ secrets.DOCKER_HUB_LOGIN }} \
                        -p ${{ secrets.DOCKER_HUB_PASSWORD }}
-          make docker-publish-${{ matrix.arch }} \
-            DOCKER_REPO=${{ env.DOCKER_REPO }} \
-            DOCKER_IMAGE_TAG=${{ steps.tag.outputs.value }}
+          make docker-publish-${{ matrix.arch }}
 
   manifest:
     name: Create multi-arch manifest
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Compute image tag
         id: tag
@@ -86,10 +85,9 @@ jobs:
           fi
 
       - name: Create and push manifest
+        env:
+          DOCKER_IMAGE_TAG: ${{ steps.tag.outputs.value }}
         run: |
           docker login -u ${{ secrets.DOCKER_HUB_LOGIN }} \
                        -p ${{ secrets.DOCKER_HUB_PASSWORD }}
-          make docker-manifest \
-            DOCKER_ARCHS="amd64 arm64" \
-            DOCKER_REPO=${{ env.DOCKER_REPO }} \
-            DOCKER_IMAGE_TAG=${{ steps.tag.outputs.value }}
+          make docker-manifest DOCKER_ARCHS="amd64 arm64"
