@@ -68,6 +68,7 @@ func main() {
 		persistenceInterval = app.Flag("persistence.interval", "The minimum interval at which to write out the persistence file.").Default("5m").Duration()
 		pushUnchecked       = app.Flag("push.disable-consistency-check", "Do not check consistency of pushed metrics. DANGEROUS.").Default("false").Bool()
 		pushUTF8Names       = app.Flag("push.enable-utf8-names", "Allow UTF-8 characters in metric and label names.").Default("false").Bool()
+		metricTTL           = app.Flag("metric-ttl", "Time after which a metric group is automatically deleted if not updated (e.g. 5m, 1h). 0 disables TTL.").Default("0").Duration()
 		promlogConfig       = promslog.Config{Style: promslog.GoKitStyle}
 	)
 	promslogflag.AddFlags(app, &promlogConfig)
@@ -95,7 +96,7 @@ func main() {
 		}
 	}
 
-	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer, logger)
+	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer, logger, *metricTTL)
 
 	if *pushUTF8Names {
 		handler.EscapingScheme = model.ValueEncodingEscaping

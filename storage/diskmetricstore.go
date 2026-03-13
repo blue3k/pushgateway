@@ -14,6 +14,7 @@
 package storage
 
 import (
+	"container/list"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -48,14 +49,18 @@ var errTimestamp = errors.New("pushed metrics must not have timestamps")
 // DiskMetricStore is an implementation of MetricStore that persists metrics to
 // disk.
 type DiskMetricStore struct {
-	lock            sync.RWMutex // Protects metricFamilies.
+	lock            sync.RWMutex // Protects metricGroups.
 	writeQueue      chan WriteRequest
 	drain           chan struct{}
 	done            chan error
 	metricGroups    GroupingKeyToMetricGroup
 	persistenceFile string
 	predefinedHelp  map[string]string
-	logger          *slog.Logger
+	defaultTTL      time.Duration // 0 means no expiry
+	// ttlList and ttlIndex are only accessed from the loop() goroutine; no extra lock needed.
+	ttlList  *list.List              // grouping keys ordered oldest→newest push (front = soonest to expire)
+	ttlIndex map[string]*list.Element // key → list element for O(1) move-to-back
+	logger   *slog.Logger
 }
 
 type mfStat struct {
@@ -81,6 +86,7 @@ func NewDiskMetricStore(
 	persistenceInterval time.Duration,
 	gatherPredefinedHelpFrom prometheus.Gatherer,
 	logger *slog.Logger,
+	defaultTTL time.Duration,
 ) *DiskMetricStore {
 	// TODO: Do that outside of the constructor to allow the HTTP server to
 	//  serve /-/healthy and /-/ready earlier.
@@ -90,10 +96,28 @@ func NewDiskMetricStore(
 		done:            make(chan error),
 		metricGroups:    GroupingKeyToMetricGroup{},
 		persistenceFile: persistenceFile,
+		defaultTTL:      defaultTTL,
+		ttlList:         list.New(),
+		ttlIndex:        map[string]*list.Element{},
 		logger:          logger,
 	}
 	if err := dms.restore(); err != nil {
 		logger.Error("could not load persisted metrics", "err", err)
+	}
+	// Rebuild TTL list from restored groups, sorted oldest→newest so the front expires first.
+	type keyTime struct {
+		key string
+		t   time.Time
+	}
+	var restored []keyTime
+	for key, group := range dms.metricGroups {
+		if !group.ExpiresAt.IsZero() {
+			restored = append(restored, keyTime{key, group.ExpiresAt})
+		}
+	}
+	sort.Slice(restored, func(i, j int) bool { return restored[i].t.Before(restored[j].t) })
+	for _, item := range restored {
+		dms.ttlIndex[item.key] = dms.ttlList.PushBack(item.key)
 	}
 	if helpStrings, err := extractPredefinedHelpStrings(gatherPredefinedHelpFrom); err == nil {
 		dms.predefinedHelp = helpStrings
@@ -196,7 +220,7 @@ func (dms *DiskMetricStore) GetMetricFamiliesMap() GroupingKeyToMetricGroup {
 	groupsCopy := make(GroupingKeyToMetricGroup, len(dms.metricGroups))
 	for k, g := range dms.metricGroups {
 		metricsCopy := make(NameToTimestampedMetricFamilyMap, len(g.Metrics))
-		groupsCopy[k] = MetricGroup{Labels: g.Labels, Metrics: metricsCopy}
+		groupsCopy[k] = MetricGroup{Labels: g.Labels, Metrics: metricsCopy, ExpiresAt: g.ExpiresAt}
 		maps.Copy(metricsCopy, g.Metrics)
 	}
 	return groupsCopy
@@ -208,6 +232,37 @@ func (dms *DiskMetricStore) loop(persistenceInterval time.Duration) {
 	lastWrite := time.Time{}
 	persistDone := make(chan time.Time)
 	var persistTimer *time.Timer
+
+	// TTL scheduler: fires precisely when the front of the TTL list is due to expire.
+	ttlExpiry := make(chan struct{}, 1)
+	var ttlTimer *time.Timer
+
+	scheduleNextExpiry := func() {
+		if ttlTimer != nil {
+			ttlTimer.Stop()
+			ttlTimer = nil
+		}
+		front := dms.ttlList.Front()
+		if front == nil {
+			return
+		}
+		key := front.Value.(string)
+		group, ok := dms.metricGroups[key]
+		if !ok || group.ExpiresAt.IsZero() {
+			return
+		}
+		delay := time.Until(group.ExpiresAt)
+		if delay < 0 {
+			delay = 0
+		}
+		ttlTimer = time.AfterFunc(delay, func() {
+			select {
+			case ttlExpiry <- struct{}{}:
+			default:
+			}
+		})
+	}
+	scheduleNextExpiry() // arm timer for any groups restored from disk
 
 	checkPersist := func() {
 		if dms.persistenceFile != "" && !persistScheduled && lastWrite.After(lastPersist) {
@@ -240,13 +295,20 @@ func (dms *DiskMetricStore) loop(persistenceInterval time.Duration) {
 				close(wr.Done)
 			}
 			checkPersist()
+			scheduleNextExpiry()
 		case lastPersist = <-persistDone:
 			persistScheduled = false
 			checkPersist() // In case something has been written in the meantime.
+		case <-ttlExpiry:
+			dms.expireFromList()
+			scheduleNextExpiry()
 		case <-dms.drain:
-			// Prevent a scheduled persist from firing later.
+			// Prevent scheduled timers from firing later.
 			if persistTimer != nil {
 				persistTimer.Stop()
+			}
+			if ttlTimer != nil {
+				ttlTimer.Stop()
 			}
 			// Now draining...
 			for {
@@ -266,6 +328,29 @@ func (dms *DiskMetricStore) loop(persistenceInterval time.Duration) {
 	}
 }
 
+// expireFromList deletes metric groups at the front of the TTL list that have passed their ExpiresAt.
+// Because the list is ordered oldest→newest, we stop at the first non-expired entry.
+func (dms *DiskMetricStore) expireFromList() {
+	now := time.Now()
+	dms.lock.Lock()
+	defer dms.lock.Unlock()
+	for {
+		front := dms.ttlList.Front()
+		if front == nil {
+			break
+		}
+		key := front.Value.(string)
+		group, ok := dms.metricGroups[key]
+		if !ok || group.ExpiresAt.IsZero() || group.ExpiresAt.After(now) {
+			break
+		}
+		dms.logger.Info("expiring metric group due to TTL", "labels", group.Labels)
+		dms.ttlList.Remove(front)
+		delete(dms.ttlIndex, key)
+		delete(dms.metricGroups, key)
+	}
+}
+
 func (dms *DiskMetricStore) processWriteRequest(wr WriteRequest) {
 	dms.lock.Lock()
 	defer dms.lock.Unlock()
@@ -275,6 +360,12 @@ func (dms *DiskMetricStore) processWriteRequest(wr WriteRequest) {
 	if wr.MetricFamilies == nil {
 		// No MetricFamilies means delete request. Delete the whole
 		// metric group, and we are done here.
+		if dms.ttlList != nil {
+			if elem, ok := dms.ttlIndex[key]; ok {
+				dms.ttlList.Remove(elem)
+				delete(dms.ttlIndex, key)
+			}
+		}
 		delete(dms.metricGroups, key)
 		return
 	}
@@ -307,6 +398,19 @@ func (dms *DiskMetricStore) processWriteRequest(wr WriteRequest) {
 			GobbableMetricFamily: (*GobbableMetricFamily)(mf),
 		}
 	}
+	if dms.defaultTTL > 0 {
+		group.ExpiresAt = wr.Timestamp.Add(dms.defaultTTL)
+		if dms.ttlList != nil {
+			if elem, ok := dms.ttlIndex[key]; ok {
+				dms.ttlList.MoveToBack(elem) // re-pushed: refresh expiry order
+			} else {
+				dms.ttlIndex[key] = dms.ttlList.PushBack(key) // new group
+			}
+		}
+	} else {
+		group.ExpiresAt = time.Time{}
+	}
+	dms.metricGroups[key] = group
 }
 
 func (dms *DiskMetricStore) setPushFailedTimestamp(wr WriteRequest) {
