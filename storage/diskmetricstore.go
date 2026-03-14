@@ -58,7 +58,7 @@ type DiskMetricStore struct {
 	predefinedHelp  map[string]string
 	defaultTTL      time.Duration // 0 means no expiry
 	// ttlList and ttlIndex are only accessed from the loop() goroutine; no extra lock needed.
-	ttlList  *list.List              // grouping keys ordered oldest→newest push (front = soonest to expire)
+	ttlList  *list.List               // grouping keys ordered oldest→newest push (front = soonest to expire)
 	ttlIndex map[string]*list.Element // key → list element for O(1) move-to-back
 	logger   *slog.Logger
 }
