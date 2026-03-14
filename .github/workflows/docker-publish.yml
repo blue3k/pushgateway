@@ -8,7 +8,6 @@ on:
 
 env:
   DOCKER_REPO: ${{ secrets.DOCKER_HUB_LOGIN }}
-  DOCKER_IMAGE_NAME: pushgateway-ttl
 
 jobs:
   test:
@@ -58,7 +57,7 @@ jobs:
       - name: Build Docker image
         env:
           DOCKER_IMAGE_TAG: ${{ steps.tag.outputs.value }}
-        run: make docker-${{ matrix.arch }}
+        run: make docker-${{ matrix.arch }} DOCKER_IMAGE_NAME=pushgateway-ttl
 
       - name: Push to Docker Hub
         env:
@@ -66,7 +65,7 @@ jobs:
         run: |
           docker login -u ${{ secrets.DOCKER_HUB_LOGIN }} \
                        -p ${{ secrets.DOCKER_HUB_PASSWORD }}
-          make docker-publish-${{ matrix.arch }}
+          make docker-publish-${{ matrix.arch }} DOCKER_IMAGE_NAME=pushgateway-ttl
 
   manifest:
     name: Create multi-arch manifest
@@ -90,4 +89,4 @@ jobs:
         run: |
           docker login -u ${{ secrets.DOCKER_HUB_LOGIN }} \
                        -p ${{ secrets.DOCKER_HUB_PASSWORD }}
-          make docker-manifest DOCKER_ARCHS="amd64 arm64"
+          make docker-manifest DOCKER_ARCHS="amd64 arm64" DOCKER_IMAGE_NAME=pushgateway-ttl
